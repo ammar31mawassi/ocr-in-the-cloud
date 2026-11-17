@@ -1,0 +1,144 @@
+# OCR in the Cloud
+
+**Ammar Mawassi** · Student ID `213620586`
+
+## User
+
+My local client reads one image URL per line and uploads the file to S3.
+It checks EC2 tags for a ready Manager with a free slot and starts one if
+needed. If the Manager rejects the job, the client tries another one.
+If a reply is delayed, it retries the same Manager with the same workID.
+I chose a temporary SQS reply queue per workID so each client gets its own
+replies. The client downloads the summary and writes the HTML in input
+order. Each image links to its original URL. Failed images show the URL
+and a short error.
+
+## Manager
+
+I gave each Manager three queues for client requests, image tasks, and
+Worker results. One thread checks capacity and dispatches tasks in small
+batches. The other records results and publishes completed summaries.
+This lets the Manager accept work while results are still coming in.
+The Manager checks capacity again on admission because two clients can
+see the same free slot. It saves the job before dispatching image tasks
+and sends the client a reply after saving the summary to S3.
+
+## Worker
+
+Each Worker pulls from its Manager's shared task queue, downloads the
+image, follows redirects, and runs OCR. It returns the jobID and the text
+or error. I chose one image at a time per Worker to limit memory use.
+Workers can process images in parallel across EC2 instances. I used
+Tess4J on Windows and the packaged Tesseract executable on EC2 because
+Tess4J had a native library mismatch on the Ubuntu image.
+
+## Queues and data flow
+
+```text
+User -> request queue -> Manager -> task queue -> Workers
+Workers -> result queue -> Manager -> temporary reply queue -> User
+```
+
+S3 holds the input, progress, OCR text, and final summaries.
+
+## Scaling and load balancing
+
+I divide each active job's unfinished distinct URL count by its worker-files-n,
+add the shares, and round up. I request one Worker as the Manager starts, then adjust the target on a background thread while the request thread sends tasks. Starting and running Workers both count
+toward that target. Workers take the next task as they become free, so a
+slow image ties up only one Worker. The client waits for its own summary
+while other jobs can keep moving. The lab instance cap limits throughput.
+At much larger scale I would partition work across more Manager pools
+and use admission backpressure to keep the backlog manageable.
+
+## Persistence and failure recovery
+
+A jobID combines the workID and the URL's first input line number. I send one
+task per distinct URL in a job and reuse its result for each matching input
+row. If a URL appears twice, it gets one task and two report rows.
+The official sample has 10 distinct URLs and 24 report rows. The Manager counts an SQS redelivery only once. The Worker extends
+visibility during OCR and deletes a task after
+publishing its result. If it dies, another Worker can pick up the task
+after the timeout. I save progress in S3 so a Manager restarted with the
+same ID can reload completed results and dispatch unfinished tasks.
+
+## Security and termination
+
+The client uses my temporary Learner Lab credentials from the local AWS
+profile. EC2 uses an IAM instance profile, and the S3 bucket stays private.
+The JAR, settings file, and startup script contain no credentials.
+With `terminate`, the Manager enters `DRAINING`, rejects new jobs, and finishes
+accepted jobs before removing its queues and terminating its Workers and
+itself. The client removes its temporary reply queue.
+
+## Build and run
+
+Use Java 17 and Maven. Build with `mvn clean package` and copy
+`target/ocr-cloud-1.0-SNAPSHOT.jar` to `yourjar.jar`. From the folder with
+the JAR and the course sample input, run
+
+```powershell
+java -jar yourjar.jar input-example.txt output.html 2 12 terminate
+```
+
+The numeric arguments are Manager client capacity and files per Worker.
+The `terminate` argument is optional.
+
+Start the Learner Lab and save its temporary credentials under learnerlab
+in your local AWS credentials file. Grader-Test is configured for my lab.
+For another lab, set AWS_PROFILE, AWS_REGION, HW1_BUCKET, HW1_PREFIX,
+HW1_AMI, and HW1_INSTANCE_PROFILE in `hw1.properties` or the shell. Keep
+HW1_PREFIX at 20 letters, digits, or hyphens maximum. Set HW1_SUBNET and
+HW1_SECURITY_GROUP if needed. Set HW1_INSTANCE_LIMIT to your lab limit
+if it is below 19.
+
+Use an image with Java 17, AWS CLI, curl, and Tesseract installed, or set
+HW1_BOOT_INSTALL=true on Ubuntu x86-64. Upload yourjar.jar as ocr-cloud.jar
+along with target/ocr-worker.jar and eng.traineddata under <HW1_PREFIX>/artifacts in the private bucket.
+HW1_ARTIFACT_PREFIX can override that path. Get the language file from
+https://github.com/tesseract-ocr/tessdata_fast/blob/main/eng.traineddata
+
+## AWS sample run and tests
+
+| Setting | Value |
+| --- | --- |
+| Region | `us-east-1` |
+| AMI | Private Ubuntu 24.04 runtime image (`ami-0ab28d387d74b3e64`) |
+| Instances | One `t3.micro` Manager and one `t2.micro` Worker |
+| Parameters | Manager capacity 2, files per Worker 12 |
+| Client runtime | 72.6 seconds from client start to exit |
+| Sample output | [output-aws.html](output-aws.html), 24 rows with 12 OCR results, nine HTTP 404s, and three DNS failures |
+
+I chose `t3.micro` for the Manager's two threads and `t2.micro` for Workers
+after package installation was killed during startup on a `t2.nano`.
+The private AMI has Java 17, AWS CLI, and Tesseract installed. EC2 fetches its JAR from S3 at launch. Workers use a smaller JAR with only the runtime they need. The Grader-Test settings select this AMI and skip package installation.
+
+### Startup benchmark
+
+I start one Worker as the Manager comes up and provision additional Workers
+in the background while sending tasks. The prebuilt AMI skips package
+installation, and I reduced the Worker JAR from 71.7 MiB to 19.1 MiB.
+I added timestamps for launch, artifact download, Java readiness, and the
+first task.
+
+| Cold run | Workers | Files per Worker | Client runtime |
+| --- | ---: | ---: | ---: |
+| Before the startup changes | 1 | 12 | 109.9 s |
+| After the startup changes | 1 | 12 | 72.6 s |
+| After the startup changes | 2 | 5 | 84.3 s |
+
+The one-Worker run was 37.3 seconds faster (34%) with the same AMI and
+input. This comparison measures the startup changes together. In the
+two-Worker run, artifact downloads took about 4–6 seconds per Worker.
+
+### Other AWS checks
+
+I ran two six-image clients together and checked that each got its own
+ordered report. With capacity 1, the second client launched a separate
+Manager. A last-slot test returned one acceptance and one rejection.
+Mixed ratios of 3 and 6 launched three Workers for two six-image jobs.
+I verified Worker redelivery in the fetch log and the completed S3 summary
+after the client-side test wait expired. I restarted a draining Manager
+with three of six results saved and verified the full ordered summary.
+I also checked that draining rejected new work and that the test instances
+and queues were cleaned up.
